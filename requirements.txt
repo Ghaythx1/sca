@@ -1,0 +1,3 @@
+wcwidth
+arabic-reshaper
+python-bidi
