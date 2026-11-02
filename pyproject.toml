@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sca-scanner"
+version = "1.1.0"
+description = "Fast, multi-threaded router and CPE security auditing tool with credential disclosure analysis"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Ghaythx1" }
+]
+keywords = [
+    "network-scanner",
+    "router-audit",
+    "wifi-security",
+    "cpe-security",
+    "realtek",
+    "netis",
+    "tenda",
+    "tplink",
+    "iptime",
+    "camera-detection",
+    "security-tools",
+    "penetration-testing"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Android",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = [
+    "wcwidth>=0.2.5",
+    "arabic-reshaper>=3.0.0",
+    "python-bidi>=0.4.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ghaythx1/sca"
+Repository = "https://github.com/Ghaythx1/sca"
+Issues = "https://github.com/Ghaythx1/sca/issues"
+
+[tool.setuptools]
+script-files = ["sca"]
