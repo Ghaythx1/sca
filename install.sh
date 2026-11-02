@@ -1,54 +1,71 @@
 #!/usr/bin/env bash
-# sca installer - works on Termux (Android) and Kali/Debian Linux.
-# Usage: curl -fsSL https://raw.githubusercontent.com/Ghaythx1/sca/main/install.sh | bash
-set -eu
+#
+# sca installer for Termux (Android) and Kali/Debian Linux.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Ghaythx1/sca/main/install.sh | bash
+#
+# Environment variables:
+#   SCA_RAW        Override the raw repository base URL.
+#   SCA_SKIP_DEPS  Set to 1 to skip the optional Python dependencies.
+#
+set -euo pipefail
 
 RAW="${SCA_RAW:-https://raw.githubusercontent.com/Ghaythx1/sca/main}"
+SKIP_DEPS="${SCA_SKIP_DEPS:-0}"
 
-# Pick the right bin directory.
+info() { printf '[*] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
+
+# Termux installs into $PREFIX/bin; regular Linux uses ~/.local/bin.
 if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then
-    BIN="$PREFIX/bin"          # Termux
+    BIN="$PREFIX/bin"
 else
-    BIN="$HOME/.local/bin"     # Kali / normal Linux
+    BIN="$HOME/.local/bin"
 fi
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required."
 
 mkdir -p "$BIN"
 
 fetch() {
-    url="$1"
-    out="$2"
+    local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$url" -o "$out"
     elif command -v wget >/dev/null 2>&1; then
         wget -qO "$out" "$url"
     else
-        echo "[-] curl or wget is required." >&2
-        exit 1
+        die "curl or wget is required."
     fi
 }
 
-echo "[*] Downloading sca..."
+info "Downloading sca..."
 fetch "$RAW/sca" "$BIN/sca"
-chmod +x "$BIN/sca"
+chmod 0755 "$BIN/sca"
 
-# Optional Python helpers: exact column widths + Arabic shaping.
-echo "[*] Installing Python helpers (optional)..."
-if command -v python3 >/dev/null 2>&1; then
-    python3 -m pip install --quiet --upgrade wcwidth arabic-reshaper python-bidi 2>/dev/null \
-        || python3 -m pip install --quiet --user wcwidth arabic-reshaper python-bidi 2>/dev/null \
-        || python3 -m pip install --quiet --break-system-packages wcwidth arabic-reshaper python-bidi 2>/dev/null \
-        || echo "[!] Could not install optional Python packages; sca will still run."
-else
-    echo "[!] python3 was not found. Install it first." >&2
-    exit 1
+if [ "$SKIP_DEPS" != "1" ]; then
+    info "Installing optional Python dependencies..."
+    if ! python3 -m pip install --quiet --disable-pip-version-check \
+            wcwidth arabic-reshaper python-bidi 2>/dev/null; then
+        if ! python3 -m pip install --quiet --disable-pip-version-check --user \
+                wcwidth arabic-reshaper python-bidi 2>/dev/null; then
+            python3 -m pip install --quiet --disable-pip-version-check \
+                --break-system-packages wcwidth arabic-reshaper python-bidi \
+                2>/dev/null \
+                || warn "Could not install optional packages; sca will still run."
+        fi
+    fi
 fi
 
 echo
-echo "[+] Installed: $BIN/sca"
+ok "Installed: $BIN/sca"
+
 case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) echo "[!] Add this to your shell profile: export PATH=\"$BIN:\$PATH\"" ;;
+    *) warn "Add this to your shell profile: export PATH=\"$BIN:\$PATH\"" ;;
 esac
-echo "[+] Run it with:  sca"
-echo "    Examples:      sca          # scans 175-254"
-echo "                   sca 175 254  # explicit range"
+
+ok "Run: sca"
+printf '    Default range:  sca          # 175-254\n'
+printf '    Custom range:   sca 175 254\n'
